@@ -632,7 +632,8 @@ def main():
             hr_t = hr_t.to(device)
             lr_t_lpips = torch.from_numpy(lr_bicubic_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
             lr_t_lpips = lr_t_lpips.to(device)
-            lpips_val = lpips_fn(sr_t.float(), hr_t).item()
+            # 🌟 必须 clamp，扩散模型输出可能略微溢出 [-1, 1]，LPIPS 对此敏感
+            lpips_val = lpips_fn(sr_t.float().clamp(-1, 1), hr_t).item()
             lpips_bic = lpips_fn(lr_t_lpips, hr_t).item()
             lpips_list.append(lpips_val)
             lpips_bic_list.append(lpips_bic)

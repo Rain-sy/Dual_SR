@@ -9,18 +9,30 @@ Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration
 4. 启动时自动检测关键数值范围
 
 Usage:
-    accelerate launch --num_processes=8 --gradient_accumulation_steps 8 \
-        train_clear_control_v2.py \
+    accelerate launch --num_processes=8 --gradient_accumulation_steps 4  train_clear_control_v2.py \
         --hr_dir Data/Mix10K_HR \
         --lr_dir Data/Mix10K_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 2 \
+        --resolution 512 --num_crops 5 --batch_size 2 \
         --start_t 0.8 --epochs 60 --lr 1e-5 \
+        --clear_ckpt ckpt/clear_local_16_down_4.safetensors
+
+    accelerate launch --num_processes=8 --gradient_accumulation_steps 4  train_clear_control_v2.py \
+        --hr_dir Data/DIV2K/DIV2K_train_HR \
+        --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
+        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
+        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
+        --batch_size 4 \
+        --start_t 0.8 --epochs 150 --lr 1e-5 \
         --clear_ckpt ckpt/clear_local_16_down_4.safetensors
 """
 
 import os
+
+os.environ["TRITON_NUM_STAGES"] = "2"  # 从 2 改为 1
+os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+
 import gc
 import math
 import argparse
@@ -33,17 +45,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torch._inductor.config as inductor_config
+
+# 🌟 Inductor 配置：启用 autotune 但禁用日志输出
+import torch._inductor.config as inductor_config
 inductor_config.max_autotune = True
 inductor_config.coordinate_descent_tuning = True
-inductor_config.verbose_progress = False  # 🚀 禁用详细输出
+inductor_config.verbose_progress = False
+
+# 🌟 禁用 inductor 的 autotune 警告和日志
+import logging
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*out of resource.*")
+warnings.filterwarnings("ignore", message=".*shared memory.*")
+
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm import tqdm
 
-# 设置 Triton 环境变量（防止 shared memory 错误）
-os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
-os.environ["TRITON_NUM_STAGES"] = "2"
 
 
 # ============================================================================
@@ -110,10 +131,10 @@ class SRDataset(Dataset):
         self.resolution = resolution
         self.num_crops = num_crops
         self.scale = 4
-        self.is_val = is_val
+        self.is_val = is_val  # 🌟 验证集使用中心裁剪
+        
         self.hr_files = sorted([f for f in os.listdir(hr_dir) 
                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        print(f"[Dataset] Found {len(self.hr_files)} images, {num_crops} crops each = {len(self)} samples")
     
     def __len__(self):
         return len(self.hr_files) * self.num_crops
@@ -135,26 +156,25 @@ class SRDataset(Dataset):
         hr_img = Image.open(os.path.join(self.hr_dir, hr_name)).convert('RGB')
         lr_img = Image.open(self._find_lr_file(hr_name)).convert('RGB')
         
-        # 随机裁剪
+        # 裁剪逻辑
         hr_w, hr_h = hr_img.size
         crop_size = self.resolution
         lr_crop_size = crop_size // self.scale
         
         if hr_w >= crop_size and hr_h >= crop_size:
             if self.is_val:
-                # 验证集使用中心裁剪 (Center Crop)
+                # 🌟 验证集使用中心裁剪，保证每次评估的是同一区域
                 x = (hr_w - crop_size) // 2
                 y = (hr_h - crop_size) // 2
             else:
-                # 训练集保持随机裁剪
+                # 训练集使用随机裁剪
                 x = np.random.randint(0, hr_w - crop_size + 1)
                 y = np.random.randint(0, hr_h - crop_size + 1)
         else:
-            # 图像小于 crop_size，resize 到目标尺寸
             x, y = 0, 0
             hr_img = hr_img.resize((crop_size, crop_size), Image.BICUBIC)
             lr_img = lr_img.resize((lr_crop_size, lr_crop_size), Image.BICUBIC)
-
+        
         hr_crop = hr_img.crop((x, y, x + crop_size, y + crop_size))
         lr_x, lr_y = x // self.scale, y // self.scale
         lr_crop = lr_img.crop((lr_x, lr_y, lr_x + lr_crop_size, lr_y + lr_crop_size))
@@ -193,6 +213,7 @@ class DualStreamFLUXSR(nn.Module):
         from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
         
         dtype = torch.bfloat16
+        
         # VAE
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
@@ -248,6 +269,7 @@ class DualStreamFLUXSR(nn.Module):
         
         # 初始化 CLEAR
         self._init_clear()
+        
     
     def _init_clear(self):
         """初始化 CLEAR 注意力"""
@@ -621,6 +643,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--warmup_epochs', type=int, default=2)
     
     parser.add_argument('--pixel_weight', type=float, default=1.0)
     parser.add_argument('--start_t', type=float, default=0.8)
@@ -643,21 +666,42 @@ def main():
     set_seed(args.seed)
     
     device = accelerator.device
+    is_main = accelerator.is_main_process
     
     # 创建输出目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     exp_name = f"{timestamp}_clear_res{args.resolution}_crop{args.num_crops}"
     output_dir = os.path.join(args.output_dir, exp_name)
-    if accelerator.is_main_process:
+    log_file = None
+    
+    if is_main:
         os.makedirs(output_dir, exist_ok=True)
-        print(f"\n{'='*60}")
+        log_file = os.path.join(output_dir, 'train.log')
+        
+        # 写入配置到 log 文件
+        with open(log_file, 'w') as f:
+            f.write("=" * 70 + "\n")
+            f.write("FLUX SR Training with CLEAR Acceleration\n")
+            f.write("=" * 70 + "\n\n")
+            f.write(f"HR Dir: {args.hr_dir}\n")
+            f.write(f"LR Dir: {args.lr_dir}\n")
+            f.write(f"Resolution: {args.resolution}\n")
+            f.write(f"Num Crops: {args.num_crops}\n")
+            f.write(f"Batch Size: {args.batch_size}\n")
+            f.write(f"CLEAR: window={args.window_size}, down={args.down_factor}\n")
+            f.write(f"Pixel Weight: {args.pixel_weight}\n")
+            f.write(f"Start T: {args.start_t}\n")
+            f.write(f"Learning Rate: {args.lr}\n")
+            f.write(f"Warmup Epochs: {args.warmup_epochs}\n\n")
+        
+        print(f"\n{'='*70}")
         print(f"FLUX SR Training with CLEAR Acceleration")
-        print(f"{'='*60}")
+        print(f"{'='*70}")
         print(f"Output: {output_dir}")
         print(f"Resolution: {args.resolution}, Crops: {args.num_crops}")
         print(f"pixel_weight: {args.pixel_weight}, start_t: {args.start_t}")
         print(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}")
-        print(f"{'='*60}\n")
+        print(f"{'='*70}\n")
     
     # 创建数据集
     train_dataset = SRDataset(args.hr_dir, args.lr_dir, args.resolution, args.num_crops)
@@ -666,7 +710,7 @@ def main():
     
     val_loader = None
     if args.val_hr_dir and args.val_lr_dir:
-        val_dataset = SRDataset(args.val_hr_dir, args.val_lr_dir, args.resolution, num_crops=1)
+        val_dataset = SRDataset(args.val_hr_dir, args.val_lr_dir, args.resolution, num_crops=1, is_val=True)
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2)
     
     # 创建模型
@@ -679,17 +723,37 @@ def main():
     trainable_params = list(system.controlnet.parameters()) + list(system.pixel_extractor.parameters())
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     
+    # LR Scheduler (warmup + cosine)
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = len(train_loader) * args.warmup_epochs
+    
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
     # Prepare
-    system, optimizer, train_loader = accelerator.prepare(system, optimizer, train_loader)
+    system, optimizer, train_loader, scheduler = accelerator.prepare(
+        system, optimizer, train_loader, scheduler
+    )
     if val_loader:
         val_loader = accelerator.prepare(val_loader)
+    
+    if is_main:
+        total_params = sum(p.numel() for p in trainable_params)
+        print(f"Trainable params: {total_params/1e6:.2f}M")
+        print(f"Steps/epoch: {len(train_loader)}, Total steps: {total_steps}")
+        print(f"Warmup steps: {warmup_steps}")
+        print("=" * 70)
     
     # 调试第一个 batch
     first_batch = next(iter(train_loader))
     debug_ok = debug_first_batch(system, first_batch, device, accelerator)
-    if not debug_ok:
-        if accelerator.is_main_process:
-            print("⚠️  Debug check failed! Please review the output above.")
+    if not debug_ok and is_main:
+        print("⚠️  Debug check failed! Please review the output above.")
     
     # 训练循环
     best_psnr = 0
@@ -700,7 +764,7 @@ def main():
         epoch_loss = 0
         
         progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}",
-                        disable=not accelerator.is_main_process)
+                        disable=not is_main)
         
         for step, batch in enumerate(progress):
             hr = batch['hr'].to(torch.bfloat16)
@@ -718,16 +782,21 @@ def main():
             
             # Forward
             v_pred = system(x_t, lr_lat, lr, t, args.guidance)
-            loss = F.mse_loss(v_pred, target_v)
+            # 🌟 强制转为 float32 算 Loss，保证梯度精确，避免 bfloat16 下溢
+            loss = F.mse_loss(v_pred.float(), target_v.float())
             
             # Backward
             accelerator.backward(loss)
             accelerator.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
             
             epoch_loss += loss.item()
-            progress.set_postfix({'loss': f'{loss.item():.4f}'})
+            progress.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'lr': f'{scheduler.get_last_lr()[0]:.2e}'
+            })
         
         avg_loss = epoch_loss / steps_per_epoch
         
@@ -737,8 +806,12 @@ def main():
             val_psnr = validate(system, accelerator, val_loader, device,
                                num_samples=5, num_steps=20, start_t=args.start_t)
         
-        if accelerator.is_main_process:
-            print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB")
+        if is_main:
+            print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, lr={scheduler.get_last_lr()[0]:.2e}")
+            
+            # 写入 log 文件
+            with open(log_file, 'a') as f:
+                f.write(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, LR={scheduler.get_last_lr()[0]:.2e}\n")
             
             # Save checkpoint
             if (epoch + 1) % args.save_every == 0:
@@ -750,10 +823,19 @@ def main():
                 save_checkpoint(system, accelerator, epoch + 1, avg_loss, val_psnr, args,
                                os.path.join(output_dir, 'best_model.pt'))
                 print(f"  → New best PSNR: {best_psnr:.2f} dB")
+        
+        # 🌟 多卡同步：确保所有进程在 epoch 结束时对齐，避免内存碎片化
+        accelerator.wait_for_everyone()
     
-    if accelerator.is_main_process:
-        print(f"\nTraining complete! Best PSNR: {best_psnr:.2f} dB")
-        print(f"Checkpoints saved to: {output_dir}")
+    if is_main:
+        # 保存 final model
+        save_checkpoint(system, accelerator, args.epochs, avg_loss, best_psnr, args,
+                       os.path.join(output_dir, 'final_model.pt'))
+        
+        print(f"\n{'='*70}")
+        print(f"✅ Training complete! Best PSNR: {best_psnr:.2f} dB")
+        print(f"   Checkpoints saved to: {output_dir}")
+        print(f"{'='*70}")
 
 
 if __name__ == '__main__':

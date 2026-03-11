@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Checkpoints and Data
+*.pt
+*.pth
+*.safetensors
+ckpt/
+checkpoints/
+Data/
+outputs/
+eval_*/

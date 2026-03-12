@@ -16,12 +16,12 @@ Dual-Stream FLUX SR ControlNet Training - Simplified Version
     - 显存占用减少 20-40%
 
 Usage:  CUDA_VISIBLE_DEVICES=1,2,3,6,7
-    accelerate launch --num_processes=8 ---use_deepspeed etrain_dual_control_simple.py \
+    accelerate launch --num_processes=8 ---use_deepspeed2 train_dual_control.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --epochs 150 --lr 1e-5
+        --epochs 100 --lr 1e-5
 
 依赖（可选，用于额外加速）：
     pip install xformers  # 如果 PyTorch < 2.0

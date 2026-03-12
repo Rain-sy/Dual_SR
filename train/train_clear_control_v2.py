@@ -1,37 +1,32 @@
 #!/usr/bin/env python
 """
-Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration
+Dual-Stream FLUX SR ControlNet Training with CLEAR Acceleration - V2
 
-特性：
-1. CLEAR 线性注意力加速 (O(N²) → O(N))
-2. PixelFeatureExtractor 带 GroupNorm（稳定输出）
-3. Flow Matching 训练
-4. 启动时自动检测关键数值范围
+V2 修复内容：
+1. 🔴 修复推理起点：改用简单 Euler（与训练分布一致）
+2. 🔴 修复 PixelExtractor 学习率：10x 放大
+3. 🔴 修复梯度累积 bug：加上 accelerator.accumulate() 上下文
+4. 🟡 num_crops 默认改为 4
 
 Usage:
-    accelerate launch --num_processes=8 --gradient_accumulation_steps 4  train_clear_control_v2.py \
-        --hr_dir Data/Mix10K_HR \
-        --lr_dir Data/Mix10K_LR_bicubic_X4 \
-        --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
-        --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --resolution 512 --num_crops 5 --batch_size 2 \
-        --start_t 0.8 --epochs 60 --lr 1e-5 \
-        --clear_ckpt ckpt/clear_local_16_down_4.safetensors
-
-    accelerate launch --num_processes=8 --gradient_accumulation_steps 4  train_clear_control_v2.py \
+    accelerate launch --num_processes=8  \
+        train_clear_control_v2.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 4 \
-        --start_t 0.8 --epochs 150 --lr 1e-5 \
+        --batch_size 1 \
+        --epochs 150 --lr 1e-5 \
         --clear_ckpt ckpt/clear_local_16_down_4.safetensors
 """
 
 import os
+import warnings
 
-os.environ["TRITON_NUM_STAGES"] = "2"  # 从 2 改为 1
+# 🌟 必须在 import torch 之前设置
+os.environ["TRITON_NUM_STAGES"] = "2"
 os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+os.environ["TORCHINDUCTOR_LOG_LEVEL"] = "ERROR"
 
 import gc
 import math
@@ -44,15 +39,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import torch._inductor.config as inductor_config
 
-# 🌟 Inductor 配置：启用 autotune 但禁用日志输出
+# 🌟 Inductor 配置
 import torch._inductor.config as inductor_config
 inductor_config.max_autotune = True
 inductor_config.coordinate_descent_tuning = True
 inductor_config.verbose_progress = False
 
-# 🌟 禁用 inductor 的 autotune 警告和日志
+# 🌟 禁用日志
 import logging
 logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.ERROR)
@@ -60,11 +54,9 @@ logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message=".*out of resource.*")
 warnings.filterwarnings("ignore", message=".*shared memory.*")
 
-
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm import tqdm
-
 
 
 # ============================================================================
@@ -131,7 +123,7 @@ class SRDataset(Dataset):
         self.resolution = resolution
         self.num_crops = num_crops
         self.scale = 4
-        self.is_val = is_val  # 🌟 验证集使用中心裁剪
+        self.is_val = is_val
         
         self.hr_files = sorted([f for f in os.listdir(hr_dir) 
                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -163,7 +155,7 @@ class SRDataset(Dataset):
         
         if hr_w >= crop_size and hr_h >= crop_size:
             if self.is_val:
-                # 🌟 验证集使用中心裁剪，保证每次评估的是同一区域
+                # 验证集使用中心裁剪
                 x = (hr_w - crop_size) // 2
                 y = (hr_h - crop_size) // 2
             else:
@@ -269,7 +261,6 @@ class DualStreamFLUXSR(nn.Module):
         
         # 初始化 CLEAR
         self._init_clear()
-        
     
     def _init_clear(self):
         """初始化 CLEAR 注意力"""
@@ -326,7 +317,6 @@ class DualStreamFLUXSR(nn.Module):
                         processor.load_state_dict(block_weights, strict=False)
                         processor = processor.to(self.device, dtype)
                         module.set_processor(processor)
-            
     
     def _pack(self, x):
         """Pack latent for transformer: [B, C, H, W] -> [B, H*W/4, C*4]"""
@@ -350,9 +340,8 @@ class DualStreamFLUXSR(nn.Module):
         return ids.reshape(h * w, 3)
     
     def encode(self, img):
-        """Encode image to latent"""
+        """Encode image to latent (FLUX VAE with shift_factor)"""
         lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
-        # FLUX VAE shift_factor
         if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
             lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         else:
@@ -373,10 +362,10 @@ class DualStreamFLUXSR(nn.Module):
         device = noisy.device
         dtype = torch.bfloat16
         
-        # Pixel features（PixelExtractor 输出 /8，与 VAE latent 一致）
+        # Pixel features
         pixel_feat = self.pixel_extractor(lr_pixel)
         
-        # 尺寸检查（通常不需要，但保留以防万一）
+        # 尺寸检查
         if pixel_feat.shape[-2:] != lr_lat.shape[-2:]:
             pixel_feat = F.interpolate(
                 pixel_feat, size=lr_lat.shape[-2:], mode='bilinear', align_corners=False
@@ -395,7 +384,7 @@ class DualStreamFLUXSR(nn.Module):
         prompt = self.text_embeds['prompt'].expand(B, -1, -1)
         text_ids = self.text_embeds['text_ids']
         
-        # Timestep（FLUX 期望 [0, 1] 范围）
+        # Timestep
         t_input = t.to(dtype)
         
         # Guidance
@@ -431,60 +420,29 @@ class DualStreamFLUXSR(nn.Module):
         
         return self._unpack(out, H, W)
     
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, start_t=0.8):
-        """Flow Matching inference with official scheduler"""
-        from diffusers import FlowMatchEulerDiscreteScheduler
+    @torch.no_grad()
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
+        """
+        🌟 V2 修复：简单 Euler 推理（与训练分布一致）
         
+        从纯噪声出发，与 train_dual_control.py 完全一致
+        """
         B = lr_lat.shape[0]
-        device = lr_lat.device
         dtype = torch.bfloat16
         
-        # 计算 mu（动态 shift）
-        _, _, h_lat, w_lat = lr_lat.shape
-        image_seq_len = (h_lat // 2) * (w_lat // 2)
+        lr_lat = lr_lat.to(dtype)
+        lr_pixel = lr_pixel.to(dtype)
         
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            self.model_name, subfolder="scheduler"
-        )
+        # 🌟 从纯噪声出发（与训练一致）
+        lat = torch.randn_like(lr_lat)
         
-        def calculate_shift(seq_len, base_seq=256, max_seq=4096, base_shift=0.5, max_shift=1.16):
-            m = (max_shift - base_shift) / (max_seq - base_seq)
-            b = base_shift - m * base_seq
-            return seq_len * m + b
+        dt = 1.0 / num_steps
         
-        mu = calculate_shift(
-            image_seq_len,
-            scheduler.config.base_image_seq_len,
-            scheduler.config.max_image_seq_len,
-            scheduler.config.base_shift,
-            scheduler.config.max_shift,
-        )
-        scheduler.set_timesteps(num_steps, device=device, mu=mu)
-        
-        # 从 LR 插值开始（不是纯噪声）
-        noise = torch.randn_like(lr_lat)
-        if start_t < 1.0:
-            start_idx = int((1.0 - start_t) * num_steps)
-            timesteps = scheduler.timesteps[start_idx:]
-            
-            # 获取真实的起始 t（scheduler 可能是 [0,1] 或 [0,1000]）
-            first_t = timesteps[0].item()
-            actual_start_t = first_t / scheduler.config.num_train_timesteps if first_t > 1.0 else first_t
-            
-            lat = actual_start_t * noise + (1 - actual_start_t) * lr_lat
-        else:
-            lat = noise * scheduler.init_noise_sigma
-            timesteps = scheduler.timesteps
-        
-        # 去噪循环
-        for t in timesteps:
-            t_val = t.item()
-            if t_val > 1.0:
-                t_val = t_val / scheduler.config.num_train_timesteps
-            
-            t_batch = torch.full((B,), t_val, device=device, dtype=dtype)
-            v = self.forward(lat, lr_lat, lr_pixel, t_batch, guidance)
-            lat = scheduler.step(v, t, lat, return_dict=False)[0]
+        for i in range(num_steps):
+            t_val = 1.0 - i * dt
+            t = torch.full((B,), t_val, device=lr_lat.device, dtype=dtype)
+            v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
+            lat = lat - dt * v
         
         return lat
 
@@ -499,10 +457,10 @@ def calculate_psnr(pred, target):
     mse = F.mse_loss(pred, target)
     if mse == 0:
         return float('inf')
-    return 10 * torch.log10(4.0 / mse).item()  # 范围 [-1,1]，所以 max=2
+    return 10 * torch.log10(4.0 / mse).item()  # 范围 [-1,1]，max=2
 
 
-def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20, start_t=0.8):
+def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=20):
     """Validation"""
     unwrapped = accelerator.unwrap_model(system)
     unwrapped.pixel_extractor.eval()
@@ -518,7 +476,7 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
         with torch.no_grad():
             hr_lat = unwrapped.encode(hr)
             lr_lat = unwrapped.encode(lr)
-            sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps, start_t=start_t)
+            sr_lat = unwrapped.inference(lr_lat, lr, num_steps=num_steps)
             sr = unwrapped.decode(sr_lat)
         
         psnr_list.append(calculate_psnr(sr.float(), hr.float()))
@@ -540,14 +498,13 @@ def save_checkpoint(system, accelerator, epoch, loss, psnr, args, path):
         'window_size': args.window_size,
         'down_factor': args.down_factor,
         'resolution': args.resolution,
-        'start_t': args.start_t,
         'loss': loss,
         'psnr': psnr,
     }, path)
 
 
 def debug_first_batch(system, batch, device, accelerator):
-    """调试第一个 batch，检测关键数值范围"""
+    """调试第一个 batch"""
     if accelerator.is_main_process:
         print("\n" + "="*60)
         print("DEBUG: First Batch Check")
@@ -558,13 +515,11 @@ def debug_first_batch(system, batch, device, accelerator):
     lr = batch['lr'].to(device).to(torch.bfloat16)
     
     with torch.no_grad():
-        # 输入范围
         if accelerator.is_main_process:
             print(f"Input:")
             print(f"  hr shape: {hr.shape}, range: [{hr.min():.2f}, {hr.max():.2f}]")
             print(f"  lr shape: {lr.shape}, range: [{lr.min():.2f}, {lr.max():.2f}]")
         
-        # VAE encode
         hr_lat = unwrapped.encode(hr)
         lr_lat = unwrapped.encode(lr)
         
@@ -573,25 +528,22 @@ def debug_first_batch(system, batch, device, accelerator):
             print(f"  hr_lat shape: {hr_lat.shape}, range: [{hr_lat.min():.2f}, {hr_lat.max():.2f}]")
             print(f"  lr_lat shape: {lr_lat.shape}, range: [{lr_lat.min():.2f}, {lr_lat.max():.2f}]")
         
-        # Pixel Extractor
         encoder_out = unwrapped.pixel_extractor.encoder(lr)
         pixel_feat = unwrapped.pixel_extractor(lr)
         
         if accelerator.is_main_process:
             print(f"PixelFeatureExtractor:")
-            print(f"  encoder output shape: {encoder_out.shape}, range: [{encoder_out.min():.2f}, {encoder_out.max():.2f}]")
-            print(f"  pixel_feat shape: {pixel_feat.shape}, range: [{pixel_feat.min():.2f}, {pixel_feat.max():.2f}]")
-            print(f"  zero_conv.weight range: [{unwrapped.pixel_extractor.zero_conv.weight.min():.4f}, {unwrapped.pixel_extractor.zero_conv.weight.max():.4f}]")
+            print(f"  encoder output: [{encoder_out.min():.2f}, {encoder_out.max():.2f}]")
+            print(f"  pixel_feat (after zero_conv): [{pixel_feat.min():.2f}, {pixel_feat.max():.2f}]")
         
-        # Fused condition
         fused = lr_lat + unwrapped.pixel_weight * pixel_feat
         
         if accelerator.is_main_process:
             print(f"Fused Condition:")
             print(f"  pixel_weight: {unwrapped.pixel_weight}")
-            print(f"  fused shape: {fused.shape}, range: [{fused.min():.2f}, {fused.max():.2f}]")
+            print(f"  fused range: [{fused.min():.2f}, {fused.max():.2f}]")
         
-        # 模拟一个 forward pass
+        # 模拟 forward
         t = torch.rand(hr.shape[0], device=device, dtype=torch.bfloat16)
         noise = torch.randn_like(hr_lat)
         x_t = t.view(-1, 1, 1, 1) * noise + (1 - t.view(-1, 1, 1, 1)) * hr_lat
@@ -601,24 +553,18 @@ def debug_first_batch(system, batch, device, accelerator):
         
         if accelerator.is_main_process:
             print(f"Forward Pass:")
-            print(f"  t range: [{t.min():.3f}, {t.max():.3f}]")
-            print(f"  x_t (noisy) range: [{x_t.min():.2f}, {x_t.max():.2f}]")
             print(f"  v_pred range: [{v_pred.min():.2f}, {v_pred.max():.2f}]")
             print(f"  target_v range: [{target_v.min():.2f}, {target_v.max():.2f}]")
         
-        # 检查是否有异常值
         has_nan = torch.isnan(v_pred).any() or torch.isnan(target_v).any()
         has_inf = torch.isinf(v_pred).any() or torch.isinf(target_v).any()
-        pixel_feat_ok = pixel_feat.abs().max() < 100  # 应该在正常范围内
+        pixel_feat_ok = pixel_feat.abs().max() < 100
         
         if accelerator.is_main_process:
             print(f"\nHealth Check:")
-            print(f"  NaN detected: {has_nan}")
-            print(f"  Inf detected: {has_inf}")
-            print(f"  pixel_feat in normal range (<100): {pixel_feat_ok.item()}")
-            
+            print(f"  NaN: {has_nan}, Inf: {has_inf}, pixel_feat OK: {pixel_feat_ok.item()}")
             if has_nan or has_inf or not pixel_feat_ok:
-                print("  ⚠️  WARNING: Potential numerical issues detected!")
+                print("  ⚠️  WARNING: Potential issues!")
             else:
                 print("  ✅ All checks passed!")
             print("="*60 + "\n")
@@ -639,14 +585,13 @@ def main():
     parser.add_argument('--model_name', type=str, default='black-forest-labs/FLUX.1-dev')
     
     parser.add_argument('--resolution', type=int, default=512)
-    parser.add_argument('--num_crops', type=int, default=5)
+    parser.add_argument('--num_crops', type=int, default=4)  # 🌟 V2: 改为 4
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--warmup_epochs', type=int, default=2)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
     
     parser.add_argument('--pixel_weight', type=float, default=1.0)
-    parser.add_argument('--start_t', type=float, default=0.8)
     parser.add_argument('--guidance', type=float, default=3.5)
     
     # CLEAR
@@ -670,7 +615,7 @@ def main():
     
     # 创建输出目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_name = f"{timestamp}_clear_res{args.resolution}_crop{args.num_crops}"
+    exp_name = f"{timestamp}_clear_v2_res{args.resolution}_crop{args.num_crops}"
     output_dir = os.path.join(args.output_dir, exp_name)
     log_file = None
     
@@ -678,10 +623,9 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
         log_file = os.path.join(output_dir, 'train.log')
         
-        # 写入配置到 log 文件
         with open(log_file, 'w') as f:
             f.write("=" * 70 + "\n")
-            f.write("FLUX SR Training with CLEAR Acceleration\n")
+            f.write("FLUX SR Training with CLEAR Acceleration - V2\n")
             f.write("=" * 70 + "\n\n")
             f.write(f"HR Dir: {args.hr_dir}\n")
             f.write(f"LR Dir: {args.lr_dir}\n")
@@ -690,16 +634,16 @@ def main():
             f.write(f"Batch Size: {args.batch_size}\n")
             f.write(f"CLEAR: window={args.window_size}, down={args.down_factor}\n")
             f.write(f"Pixel Weight: {args.pixel_weight}\n")
-            f.write(f"Start T: {args.start_t}\n")
-            f.write(f"Learning Rate: {args.lr}\n")
+            f.write(f"Learning Rate: {args.lr} (PixelExtractor: {args.lr * 10})\n")
             f.write(f"Warmup Epochs: {args.warmup_epochs}\n\n")
         
         print(f"\n{'='*70}")
-        print(f"FLUX SR Training with CLEAR Acceleration")
+        print(f"FLUX SR Training with CLEAR Acceleration - V2")
         print(f"{'='*70}")
         print(f"Output: {output_dir}")
         print(f"Resolution: {args.resolution}, Crops: {args.num_crops}")
-        print(f"pixel_weight: {args.pixel_weight}, start_t: {args.start_t}")
+        print(f"pixel_weight: {args.pixel_weight}")
+        print(f"LR: {args.lr} (PixelExtractor: {args.lr * 10})")
         print(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}")
         print(f"{'='*70}\n")
     
@@ -719,9 +663,15 @@ def main():
         args.window_size, args.down_factor, args.clear_ckpt
     )
     
-    # 设置可训练参数
+    # 🌟 V2 修复：分组学习率（PixelExtractor 10x）
+    optimizer_grouped_parameters = [
+        {"params": system.controlnet.parameters(), "lr": args.lr},
+        {"params": system.pixel_extractor.parameters(), "lr": args.lr * 10.0}
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+    
+    # 获取所有可训练参数（用于 grad clipping）
     trainable_params = list(system.controlnet.parameters()) + list(system.pixel_extractor.parameters())
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     
     # LR Scheduler (warmup + cosine)
     total_steps = len(train_loader) * args.epochs
@@ -780,17 +730,20 @@ def main():
             x_t = t.view(-1, 1, 1, 1) * noise + (1 - t.view(-1, 1, 1, 1)) * hr_lat
             target_v = noise - hr_lat
             
-            # Forward
-            v_pred = system(x_t, lr_lat, lr, t, args.guidance)
-            # 🌟 强制转为 float32 算 Loss，保证梯度精确，避免 bfloat16 下溢
-            loss = F.mse_loss(v_pred.float(), target_v.float())
-            
-            # Backward
-            accelerator.backward(loss)
-            accelerator.clip_grad_norm_(trainable_params, 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+            # 🌟 V2 修复：正确的梯度累积
+            with accelerator.accumulate(system):
+                v_pred = system(x_t, lr_lat, lr, t, args.guidance)
+                loss = F.mse_loss(v_pred.float(), target_v.float())
+                
+                accelerator.backward(loss)
+                
+                # 🌟 只在 sync 时才做 clip 和 step
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(trainable_params, 1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
             
             epoch_loss += loss.item()
             progress.set_postfix({
@@ -804,16 +757,14 @@ def main():
         val_psnr = 0
         if val_loader and (epoch + 1) % args.val_every == 0:
             val_psnr = validate(system, accelerator, val_loader, device,
-                               num_samples=5, num_steps=20, start_t=args.start_t)
+                               num_samples=5, num_steps=20)
         
         if is_main:
             print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_psnr={val_psnr:.2f} dB, lr={scheduler.get_last_lr()[0]:.2e}")
             
-            # 写入 log 文件
             with open(log_file, 'a') as f:
                 f.write(f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, LR={scheduler.get_last_lr()[0]:.2e}\n")
             
-            # Save checkpoint
             if (epoch + 1) % args.save_every == 0:
                 save_checkpoint(system, accelerator, epoch + 1, avg_loss, val_psnr, args,
                                os.path.join(output_dir, f'epoch_{epoch+1}.pt'))
@@ -824,11 +775,9 @@ def main():
                                os.path.join(output_dir, 'best_model.pt'))
                 print(f"  → New best PSNR: {best_psnr:.2f} dB")
         
-        # 🌟 多卡同步：确保所有进程在 epoch 结束时对齐，避免内存碎片化
         accelerator.wait_for_everyone()
     
     if is_main:
-        # 保存 final model
         save_checkpoint(system, accelerator, args.epochs, avg_loss, best_psnr, args,
                        os.path.join(output_dir, 'final_model.pt'))
         

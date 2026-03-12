@@ -13,6 +13,13 @@ Usage:
 """
 
 import os
+import warnings
+
+# 🌟 必须在 import torch 之前设置环境变量
+os.environ["TRITON_NUM_STAGES"] = "1"
+os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
+os.environ["TORCHINDUCTOR_LOG_LEVEL"] = "ERROR"
+
 import gc
 import argparse
 import numpy as np
@@ -24,9 +31,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 设置 Triton 环境变量
-os.environ["TRITON_PRINT_AUTOTUNING"] = "0"
-os.environ["TRITON_NUM_STAGES"] = "2"
+# 🌟 Inductor 配置
+import torch._inductor.config as inductor_config
+inductor_config.max_autotune = True
+inductor_config.coordinate_descent_tuning = True
+inductor_config.verbose_progress = False
+
+# 🌟 禁用日志
+import logging
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor.select_algorithm").setLevel(logging.ERROR)
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*out of resource.*")
+warnings.filterwarnings("ignore", message=".*shared memory.*")
 
 
 # ============================================================================
@@ -407,55 +424,28 @@ class CLEAREvaluator:
         return self._unpack(pred, H, W)
     
     @torch.no_grad()
-    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5, start_t=0.8):
-        from diffusers import FlowMatchEulerDiscreteScheduler
-        
+    def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5):
+        """
+        简单 Euler 推理（与训练分布一致）
+        从纯噪声出发，与 train_clear_control_v2.py 完全一致
+        """
         B = lr_lat.shape[0]
         device = lr_lat.device
         dtype = torch.bfloat16
         
-        _, _, h_lat, w_lat = lr_lat.shape
-        image_seq_len = (h_lat // 2) * (w_lat // 2)
+        lr_lat = lr_lat.to(dtype)
+        lr_pixel = lr_pixel.to(dtype)
         
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            self.model_name, subfolder="scheduler"
-        )
+        # 从纯噪声开始（与训练一致）
+        lat = torch.randn_like(lr_lat)
         
-        def calculate_shift(seq_len, base_seq=256, max_seq=4096, base_shift=0.5, max_shift=1.16):
-            m = (max_shift - base_shift) / (max_seq - base_seq)
-            b = base_shift - m * base_seq
-            return seq_len * m + b
+        dt = 1.0 / num_steps
         
-        mu = calculate_shift(
-            image_seq_len,
-            scheduler.config.base_image_seq_len,
-            scheduler.config.max_image_seq_len,
-            scheduler.config.base_shift,
-            scheduler.config.max_shift,
-        )
-        scheduler.set_timesteps(num_steps, device=device, mu=mu)
-        
-        noise = torch.randn_like(lr_lat)
-        if start_t < 1.0:
-            start_idx = int((1.0 - start_t) * num_steps)
-            timesteps = scheduler.timesteps[start_idx:]
-            
-            first_t = timesteps[0].item()
-            actual_start_t = first_t / scheduler.config.num_train_timesteps if first_t > 1.0 else first_t
-            
-            lat = actual_start_t * noise + (1 - actual_start_t) * lr_lat
-        else:
-            lat = noise * scheduler.init_noise_sigma
-            timesteps = scheduler.timesteps
-        
-        for t in timesteps:
-            t_val = t.item()
-            if t_val > 1.0:
-                t_val = t_val / scheduler.config.num_train_timesteps
-            
-            t_batch = torch.full((B,), t_val, device=device, dtype=dtype)
-            v = self.forward(lat, lr_lat, lr_pixel, t_batch, guidance)
-            lat = scheduler.step(v, t, lat, return_dict=False)[0]
+        for i in range(num_steps):
+            t_val = 1.0 - i * dt
+            t = torch.full((B,), t_val, device=device, dtype=dtype)
+            v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
+            lat = lat - dt * v
         
         return lat
 
@@ -473,7 +463,6 @@ def main():
     
     parser.add_argument('--num_steps', type=int, default=20)
     parser.add_argument('--guidance', type=float, default=3.5)
-    parser.add_argument('--start_t', type=float, default=0.8)
     
     parser.add_argument('--window_size', type=int, default=16)
     parser.add_argument('--down_factor', type=int, default=4)
@@ -493,6 +482,10 @@ def main():
     args = parser.parse_args()
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    
+    # 设置默认 CUDA 设备（CLEAR 的 flex_attention 需要）
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
     
     # 自动检测数据集名称
     if args.dataset is None:
@@ -529,7 +522,7 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset}")
     print(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}")
-    print(f"Steps: {args.num_steps}, Guidance: {args.guidance}, start_t: {args.start_t}")
+    print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
     if args.force_512:
         print(f"⚠️  Force 512x512 mode")
     print(f"Output: {output_dir}")
@@ -610,7 +603,7 @@ def main():
         # 推理
         lr_lat = evaluator.encode(lr_t)
         sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=args.num_steps, 
-                                      guidance=args.guidance, start_t=args.start_t)
+                                      guidance=args.guidance)
         sr_t = evaluator.decode(sr_lat)
         
         # 转 numpy
@@ -684,7 +677,7 @@ def main():
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
         f.write(f"CLEAR: window={args.window_size}, down_factor={args.down_factor}\n")
-        f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}, start_t: {args.start_t}\n")
+        f.write(f"Steps: {args.num_steps}, Guidance: {args.guidance}\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n\n")
         f.write(f"Bicubic:      PSNR={avg_psnr_bic:.4f}, SSIM={avg_ssim_bic:.4f}")
         if lpips_fn:

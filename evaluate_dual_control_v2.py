@@ -322,7 +322,7 @@ class DualStreamEvaluator:
     def inference(self, lr_lat, lr_pixel, num_steps=20, guidance=3.5,
                   start_mode='standard', start_t=1.0):
         """
-        Euler 推理
+        Euler 推理 (已修复 SDEdit 时间步截断)
         
         Args:
             start_mode:
@@ -338,20 +338,26 @@ class DualStreamEvaluator:
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 根据模式选择起点
         noise = torch.randn_like(lr_lat)
-        if start_mode == 'standard':
-            lat = noise
-        elif start_mode == 'mean':
-            lat = lr_lat.clone()
-        elif start_mode == 'mixed':
-            lat = start_t * noise + (1 - start_t) * lr_lat
-        else:
-            lat = noise
-        
         dt = 1.0 / num_steps
         
-        for i in range(num_steps):
+        # 🌟 根据起点模式计算 start_step
+        if start_mode == 'standard':
+            lat = noise
+            start_step = 0  # 从 t=1.0 开始
+        elif start_mode == 'mean':
+            lat = lr_lat.clone()
+            start_step = 0  # Mean Flow 的 t=1.0 就是 lr_lat
+        elif start_mode == 'mixed':
+            lat = start_t * noise + (1 - start_t) * lr_lat
+            # 🌟 关键：跳过前 (1-start_t) 比例的步数
+            start_step = round((1.0 - start_t) * num_steps)
+        else:
+            lat = noise
+            start_step = 0
+        
+        # 🌟 从正确的时间步开始积分
+        for i in range(start_step, num_steps):
             t_val = 1.0 - i * dt
             t = torch.full((B,), t_val, device=device, dtype=dtype)
             v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
@@ -370,6 +376,7 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
     """Run SR with tiling for large images"""
     _, _, H, W = lr_t.shape
     
+    # 如果图像足够小，直接处理
     if H <= tile_size and W <= tile_size:
         lr_lat = evaluator.encode(lr_t)
         sr_lat = evaluator.inference(lr_lat, lr_t, num_steps=num_steps, guidance=guidance,
@@ -380,38 +387,67 @@ def run_sr_tiled(evaluator, lr_t, device, num_steps=20, guidance=3.5,
     out = torch.zeros_like(lr_t)
     weight = torch.zeros((1, 1, H, W), device=device)
     
-    # 创建 blend mask
-    blend = torch.ones((1, 1, tile_size, tile_size), device=device)
-    if blend_mode == 'linear':
-        for i in range(overlap):
-            factor = i / overlap
-            blend[:, :, i, :] *= factor
-            blend[:, :, -i-1, :] *= factor
-            blend[:, :, :, i] *= factor
-            blend[:, :, :, -i-1] *= factor
+    # 计算 tile 位置（处理边界情况）
+    if H <= tile_size:
+        y_positions = [0]
+    else:
+        y_positions = list(range(0, H - tile_size + 1, stride))
+        if not y_positions:
+            y_positions = [0]
+        elif y_positions[-1] + tile_size < H:
+            y_positions.append(H - tile_size)
     
-    y_positions = list(range(0, H - tile_size + 1, stride))
-    if y_positions[-1] + tile_size < H:
-        y_positions.append(H - tile_size)
-    
-    x_positions = list(range(0, W - tile_size + 1, stride))
-    if x_positions[-1] + tile_size < W:
-        x_positions.append(W - tile_size)
+    if W <= tile_size:
+        x_positions = [0]
+    else:
+        x_positions = list(range(0, W - tile_size + 1, stride))
+        if not x_positions:
+            x_positions = [0]
+        elif x_positions[-1] + tile_size < W:
+            x_positions.append(W - tile_size)
     
     total_tiles = len(y_positions) * len(x_positions)
     
     with tqdm(total=total_tiles, desc="Tiled SR", leave=False) as pbar:
         for y in y_positions:
             for x in x_positions:
-                tile = lr_t[:, :, y:y+tile_size, x:x+tile_size]
+                # 计算实际 tile 边界（处理边缘情况）
+                y_end = min(y + tile_size, H)
+                x_end = min(x + tile_size, W)
+                tile_h = y_end - y
+                tile_w = x_end - x
+                
+                tile = lr_t[:, :, y:y_end, x:x_end]
+                
+                # 如果 tile 小于 tile_size，需要 padding
+                if tile_h < tile_size or tile_w < tile_size:
+                    padded = torch.zeros((1, 3, tile_size, tile_size), device=device, dtype=lr_t.dtype)
+                    padded[:, :, :tile_h, :tile_w] = tile
+                    tile = padded
                 
                 tile_lat = evaluator.encode(tile)
                 sr_lat = evaluator.inference(tile_lat, tile, num_steps=num_steps, guidance=guidance,
                                             start_mode=start_mode, start_t=start_t)
                 sr_tile = evaluator.decode(sr_lat)
                 
-                out[:, :, y:y+tile_size, x:x+tile_size] += sr_tile * blend
-                weight[:, :, y:y+tile_size, x:x+tile_size] += blend
+                # 只取有效部分
+                sr_tile = sr_tile[:, :, :tile_h, :tile_w]
+                
+                # 创建对应大小的 blend mask
+                if tile_h == tile_size and tile_w == tile_size:
+                    tile_blend = torch.ones((1, 1, tile_size, tile_size), device=device)
+                    if blend_mode == 'linear':
+                        for i in range(min(overlap, tile_size // 2)):
+                            factor = i / overlap
+                            tile_blend[:, :, i, :] *= factor
+                            tile_blend[:, :, -i-1, :] *= factor
+                            tile_blend[:, :, :, i] *= factor
+                            tile_blend[:, :, :, -i-1] *= factor
+                else:
+                    tile_blend = torch.ones((1, 1, tile_h, tile_w), device=device)
+                
+                out[:, :, y:y_end, x:x_end] += sr_tile * tile_blend
+                weight[:, :, y:y_end, x:x_end] += tile_blend
                 
                 pbar.update(1)
     

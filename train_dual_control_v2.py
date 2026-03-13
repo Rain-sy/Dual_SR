@@ -21,6 +21,8 @@ Usage:
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
         --batch_size 2 --epochs 120 --lr 1e-5  --flow_mode mean 
+
+        --flow_mode mixed --mix_prob 0.5
 """
 
 import os
@@ -217,14 +219,14 @@ class DualStreamFLUXSR(nn.Module):
             time.sleep(local_rank * 5)
         
         # Load VAE
-        #(f"[Rank {local_rank}] Loading VAE...")
+        print(f"[Rank {local_rank}] Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
         self.vae.requires_grad_(False)
         
         # Cache text embeddings
-        #print(f"[Rank {local_rank}] Caching text embeddings...")
+        print(f"[Rank {local_rank}] Caching text embeddings...")
         text_enc = CLIPTextModel.from_pretrained(
             self.model_name, subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
@@ -250,7 +252,7 @@ class DualStreamFLUXSR(nn.Module):
         gc.collect()
         
         # Load Transformer
-        #print(f"[Rank {local_rank}] Loading FLUX Transformer...")
+        print(f"[Rank {local_rank}] Loading FLUX Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
@@ -258,19 +260,19 @@ class DualStreamFLUXSR(nn.Module):
         
         # Load ControlNet
         controlnet_path = pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
-        #print(f"[Rank {local_rank}] Loading ControlNet from {controlnet_path}...")
+        print(f"[Rank {local_rank}] Loading ControlNet from {controlnet_path}...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             controlnet_path, torch_dtype=dtype
         ).to(self.device)
         
         # Pixel Feature Extractor
-        #print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
+        print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         
         # 启用 Flash Attention
         self._enable_flash_attention(local_rank)
         
-        #print(f"[Rank {local_rank}] ✓ All models loaded")
+        print(f"[Rank {local_rank}] ✓ All models loaded")
     
     def _enable_flash_attention(self, local_rank=0):
         """启用 Flash Attention 加速（xformers 或 PyTorch 2.0 SDPA）"""
@@ -397,27 +399,34 @@ class DualStreamFLUXSR(nn.Module):
             start_t: mixed 模式下的混合比例（1.0=纯噪声，0.0=纯lr_lat）
         """
         B = lr_lat.shape[0]
+        device = lr_lat.device
         dtype = torch.bfloat16
         
         lr_lat = lr_lat.to(dtype)
         lr_pixel = lr_pixel.to(dtype)
         
-        # 根据模式选择起点
         noise = torch.randn_like(lr_lat)
-        if start_mode == 'standard':
-            lat = noise
-        elif start_mode == 'mean':
-            lat = lr_lat.clone()
-        elif start_mode == 'mixed':
-            lat = start_t * noise + (1 - start_t) * lr_lat
-        else:
-            lat = noise  # fallback
-        
         dt = 1.0 / num_steps
         
-        for i in range(num_steps):
+        # 🌟 根据起点模式计算 start_step
+        if start_mode == 'standard':
+            lat = noise
+            start_step = 0  # 从 t=1.0 开始
+        elif start_mode == 'mean':
+            lat = lr_lat.clone()
+            start_step = 0  # Mean Flow 的 t=1.0 就是 lr_lat
+        elif start_mode == 'mixed':
+            lat = start_t * noise + (1 - start_t) * lr_lat
+            # 🌟 关键：跳过前 (1-start_t) 比例的步数
+            start_step = round((1.0 - start_t) * num_steps)
+        else:
+            lat = noise
+            start_step = 0
+        
+        # 🌟 从正确的时间步开始积分
+        for i in range(start_step, num_steps):
             t_val = 1.0 - i * dt
-            t = torch.full((B,), t_val, device=lr_lat.device, dtype=dtype)
+            t = torch.full((B,), t_val, device=device, dtype=dtype)
             v = self.forward(lat, lr_lat, lr_pixel, t, guidance)
             lat = lat - dt * v
         
@@ -512,16 +521,16 @@ def validate(system, accelerator, val_loader, device, num_samples=5, num_steps=2
     
     psnr_list = []
     
-    # 根据训练模式选择推理起点
+    # 根据训练模式选择推理起点（必须与训练分布一致！）
     if flow_mode == 'standard':
-        start_mode = 'standard'
+        start_mode = 'standard'  # 从纯噪声开始
         start_t = 1.0
     elif flow_mode == 'mean':
-        start_mode = 'mixed'  # 用 mixed 起点，保留部分噪声激发生成能力
-        start_t = 0.8
+        start_mode = 'mean'  # 从 lr_lat 开始（与训练一致）
+        start_t = 1.0
     else:  # mixed
         start_mode = 'mixed'
-        start_t = 0.8  # 🌟 SDEdit 风格，80% 噪声 + 20% lr_lat
+        start_t = 0.5  # 混合模式用中间值
     
     for i, batch in enumerate(val_loader):
         if i >= num_samples:
@@ -582,9 +591,9 @@ def main():
     
     # Training
     parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--epochs', type=int, default=120)
+    parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--lr', type=float, default=1e-5)
-    parser.add_argument('--warmup_epochs', type=int, default=3)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--guidance', type=float, default=3.5)
     
     # Flow mode
@@ -611,6 +620,7 @@ def main():
         args.train_controlnet = False
     
     # Initialize accelerator
+    # 注意：gradient_accumulation_steps 由 DeepSpeed 配置文件控制
     accelerator = Accelerator(
         mixed_precision='bf16',
     )
@@ -788,7 +798,12 @@ def main():
             
             accelerator.backward(loss)
             optimizer.step()
-            scheduler.step()
+            
+            # 🌟 关键修复：只在梯度同步时才更新学习率
+            # 否则累积步数为 N 时，LR 会以 N 倍速度衰减
+            if accelerator.sync_gradients:
+                scheduler.step()
+            
             optimizer.zero_grad()
             
             epoch_losses.append(loss.item())

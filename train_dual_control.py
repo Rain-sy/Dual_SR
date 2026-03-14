@@ -520,7 +520,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=5)
-    parser.add_argument('--val_interval', type=int, default=5)
+    parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--save_interval', type=int, default=10)
     
     # Memory optimization
@@ -575,6 +575,19 @@ def main():
         print("=" * 70)
         print("\n⚠️  Using STANDARD Flow Matching (no MeanFlow)")
         print(f"    Pixel weight = {args.pixel_weight} (lower = more texture)\n")
+        
+        # 🌟🌟🌟 新增：初始化 log 文件 🌟🌟🌟
+        log_path = os.path.join(save_dir, 'training_log.txt')
+        with open(log_path, 'w') as f:
+            f.write("=" * 70 + "\n")
+            f.write("Dual-Stream FLUX SR - Simplified (Standard Flow Matching)\n")
+            f.write("=" * 70 + "\n\n")
+            f.write(f"Model: {args.model_name}\n")
+            f.write(f"ControlNet: {args.pretrained_controlnet}\n")
+            f.write(f"Mode: {'ControlNet + Pixel Extractor' if train_controlnet else 'Pixel Extractor only'}\n")
+            f.write(f"Pixel Weight: {args.pixel_weight}\n")
+            f.write(f"Resolution: {args.resolution}\n")
+            f.write(f"Learning Rate: {args.lr}\n\n")
     
     # Create model
     system = DualStreamFLUXSR(
@@ -743,6 +756,11 @@ def main():
                 torch.cuda.empty_cache()
             else:
                 print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}")
+            # 🌟🌟🌟 新增：追加写入当轮数据到 log 🌟🌟🌟
+            lr_current = scheduler.get_last_lr()[0]
+            log_line = f"Epoch {epoch+1}: Loss={avg_loss:.6f}, PSNR={val_psnr:.2f}, LR={lr_current:.2e}\n"
+            with open(log_path, 'a') as f:
+                f.write(log_line)
             
             # Save checkpoint
             if (epoch + 1) % args.save_interval == 0:

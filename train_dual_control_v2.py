@@ -145,22 +145,29 @@ class SRDataset(Dataset):
         
         # 裁剪逻辑
         hr_w, hr_h = hr_img.size
+        lr_w, lr_h = lr_img.size
         crop_size = self.resolution
         lr_crop_size = crop_size // self.scale
         
         if hr_w >= crop_size and hr_h >= crop_size:
             if self.is_val:
                 # 验证集使用中心裁剪
+                # 🌟 强制将坐标对齐到 scale 的倍数，防止中心裁剪错位
                 x = (hr_w - crop_size) // 2
                 y = (hr_h - crop_size) // 2
+                x = x - (x % self.scale)
+                y = y - (y % self.scale)
             else:
-                # 训练集使用随机裁剪
-                x = np.random.randint(0, hr_w - crop_size + 1)
-                y = np.random.randint(0, hr_h - crop_size + 1)
+                # 🌟 训练集：先在 LR 上采样坐标，再乘以 scale
+                # 这样保证 HR 和 LR 完美对齐！
+                lr_x = np.random.randint(0, lr_w - lr_crop_size + 1)
+                lr_y = np.random.randint(0, lr_h - lr_crop_size + 1)
+                x = lr_x * self.scale
+                y = lr_y * self.scale
             
             hr_crop = hr_img.crop((x, y, x + crop_size, y + crop_size))
             
-            # 对应 LR 区域
+            # 对应 LR 区域（现在绝对精确！）
             lr_x, lr_y = x // self.scale, y // self.scale
             lr_crop = lr_img.crop((lr_x, lr_y, lr_x + lr_crop_size, lr_y + lr_crop_size))
         else:
@@ -219,14 +226,12 @@ class DualStreamFLUXSR(nn.Module):
             time.sleep(local_rank * 5)
         
         # Load VAE
-        print(f"[Rank {local_rank}] Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
         self.vae.requires_grad_(False)
         
         # Cache text embeddings
-        print(f"[Rank {local_rank}] Caching text embeddings...")
         text_enc = CLIPTextModel.from_pretrained(
             self.model_name, subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
@@ -252,7 +257,6 @@ class DualStreamFLUXSR(nn.Module):
         gc.collect()
         
         # Load Transformer
-        print(f"[Rank {local_rank}] Loading FLUX Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
@@ -260,19 +264,16 @@ class DualStreamFLUXSR(nn.Module):
         
         # Load ControlNet
         controlnet_path = pretrained_controlnet or "jasperai/Flux.1-dev-Controlnet-Upscaler"
-        print(f"[Rank {local_rank}] Loading ControlNet from {controlnet_path}...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             controlnet_path, torch_dtype=dtype
         ).to(self.device)
         
         # Pixel Feature Extractor
-        print(f"[Rank {local_rank}] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         
         # 启用 Flash Attention
         self._enable_flash_attention(local_rank)
         
-        print(f"[Rank {local_rank}] ✓ All models loaded")
     
     def _enable_flash_attention(self, local_rank=0):
         """启用 Flash Attention 加速（xformers 或 PyTorch 2.0 SDPA）"""
@@ -286,21 +287,12 @@ class DualStreamFLUXSR(nn.Module):
                 print(f"[Flash] xformers not available ({e}), using PyTorch 2.0 SDPA")
     
     def encode(self, img):
-        """Encode image to latent (FLUX VAE with shift_factor)"""
-        lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
-        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
-            lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-        else:
-            lat = lat * self.vae.config.scaling_factor
-        return lat
+        """Encode image to latent"""
+        return self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
     
     def decode(self, lat):
         """Decode latent to image"""
-        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
-            lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-        else:
-            lat = lat / self.vae.config.scaling_factor
-        return self.vae.decode(lat.to(self.vae.dtype)).sample
+        return self.vae.decode((lat / self.vae.config.scaling_factor).to(self.vae.dtype)).sample
     
     def _pack(self, x):
         """Pack latent for transformer: [B, C, H, W] -> [B, H*W/4, C*4]"""
@@ -476,7 +468,6 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, flow_mode='stan
         # 每个 batch 随机选择
         use_noise = torch.rand(B, device=device) < mix_prob
         use_noise = use_noise.view(B, 1, 1, 1).float()
-        
         # 🌟 给 lr_lat 加微扰动，逼迫 Pixel Extractor 强力发力
         mean_flow_start = lr_lat + mean_noise_scale * torch.randn_like(lr_lat)
         
@@ -491,9 +482,8 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, flow_mode='stan
     # 目标速度：v = source - hr_lat
     target_v = source - hr_lat
     
-    # 预测
-    unwrapped = system.module if hasattr(system, 'module') else system
-    v_pred = unwrapped.forward(x_t, lr_lat, lr_pixel, t)
+    # 🌟 修复：直接调用 system 触发 __call__，不要绕开 DDP/DeepSpeed 钩子
+    v_pred = system(x_t, lr_lat, lr_pixel, t)
     
     # Loss (float32 计算)
     loss = F.mse_loss(v_pred.float(), target_v.float())

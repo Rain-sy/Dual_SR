@@ -13,16 +13,15 @@ V2 改进：
 6. Loss float32 计算
 
 Usage:
+    CUDA_VISIBLE_DEVICES=0,1,3,4,5,7
     accelerate launch --num_processes=8 \
-        --gradient_accumulation_steps=4 \
+        --gradient_accumulation_steps=8 \
         train_dual_control_v2.py \
         --hr_dir Data/DIV2K/DIV2K_train_HR \
         --lr_dir Data/DIV2K/DIV2K_train_LR_bicubic_X4 \
         --val_hr_dir Data/DIV2K/DIV2K_valid_HR \
         --val_lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --batch_size 2 --epochs 120 --lr 1e-5  --flow_mode mean 
-
-        --flow_mode mixed --mix_prob 0.5
+        --batch_size 2 --epochs 150 --lr 1e-5
 """
 
 import os
@@ -106,6 +105,7 @@ class SRDataset(Dataset):
     - num_crops: 每张图像随机裁剪次数
     - is_val: 验证集使用中心裁剪
     - 自动匹配 LR 文件名
+    - 自动过滤无效文件对
     """
     
     def __init__(self, hr_dir, lr_dir, resolution=512, num_crops=1, is_val=False):
@@ -116,8 +116,31 @@ class SRDataset(Dataset):
         self.scale = 4
         self.is_val = is_val
         
-        self.hr_files = sorted([f for f in os.listdir(hr_dir) 
-                                if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        # 获取所有 HR 文件
+        all_hr_files = sorted([f for f in os.listdir(hr_dir) 
+                               if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        
+        # 只保留有对应 LR 文件的 HR 文件
+        self.hr_files = []
+        self.lr_files = []
+        self.skipped = 0
+        
+        for hr_name in all_hr_files:
+            hr_path = os.path.join(self.hr_dir, hr_name)
+            # 检查 HR 文件是否存在
+            if not os.path.exists(hr_path):
+                self.skipped += 1
+                continue
+            
+            lr_path = self._find_lr_file(hr_name)
+            if lr_path and os.path.exists(lr_path):
+                self.hr_files.append(hr_name)
+                self.lr_files.append(lr_path)
+            else:
+                self.skipped += 1
+        
+        if len(self.hr_files) == 0:
+            raise ValueError(f"No valid HR/LR pairs found in {hr_dir} and {lr_dir}")
     
     def __len__(self):
         return len(self.hr_files) * self.num_crops
@@ -134,14 +157,19 @@ class SRDataset(Dataset):
                     return candidate
         
         # 回退：直接使用相同文件名
-        return os.path.join(self.lr_dir, hr_name)
+        fallback = os.path.join(self.lr_dir, hr_name)
+        if os.path.exists(fallback):
+            return fallback
+        
+        return None
     
     def __getitem__(self, idx):
         img_idx = idx // self.num_crops
         hr_name = self.hr_files[img_idx]
+        lr_path = self.lr_files[img_idx]
         
         hr_img = Image.open(os.path.join(self.hr_dir, hr_name)).convert('RGB')
-        lr_img = Image.open(self._find_lr_file(hr_name)).convert('RGB')
+        lr_img = Image.open(lr_path).convert('RGB')
         
         # 裁剪逻辑
         hr_w, hr_h = hr_img.size
@@ -274,17 +302,16 @@ class DualStreamFLUXSR(nn.Module):
         # 启用 Flash Attention
         self._enable_flash_attention(local_rank)
         
+        if local_rank == 0:
+            print(f"[Models] ✓ All models loaded (GPU mem: {torch.cuda.memory_allocated(self.device)/1e9:.1f} GB)")
     
     def _enable_flash_attention(self, local_rank=0):
         """启用 Flash Attention 加速（xformers 或 PyTorch 2.0 SDPA）"""
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
             self.controlnet.enable_xformers_memory_efficient_attention()
-            if local_rank == 0:
-                print("[Flash] ✓ Enabled xformers memory efficient attention")
-        except Exception as e:
-            if local_rank == 0:
-                print(f"[Flash] xformers not available ({e}), using PyTorch 2.0 SDPA")
+        except Exception:
+            pass  # 默认使用 PyTorch 2.0 SDPA
     
     def encode(self, img):
         """Encode image to latent"""
@@ -468,6 +495,7 @@ def compute_flow_matching_loss(system, hr_lat, lr_lat, lr_pixel, flow_mode='stan
         # 每个 batch 随机选择
         use_noise = torch.rand(B, device=device) < mix_prob
         use_noise = use_noise.view(B, 1, 1, 1).float()
+        
         # 🌟 给 lr_lat 加微扰动，逼迫 Pixel Extractor 强力发力
         mean_flow_start = lr_lat + mean_noise_scale * torch.randn_like(lr_lat)
         
@@ -690,11 +718,14 @@ def main():
             num_crops=1, is_val=True
         )
         val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
-        if is_main:
-            print(f"[Data] Training: {len(train_dataset)}, Validation: {len(val_dataset)}")
-    else:
-        if is_main:
-            print(f"[Data] Training: {len(train_dataset)}")
+    
+    if is_main:
+        train_info = f"Train: {len(train_dataset)} ({len(train_dataset.hr_files)} images × {args.num_crops} crops)"
+        if train_dataset.skipped > 0:
+            train_info += f", skipped {train_dataset.skipped}"
+        print(f"[Data] {train_info}")
+        if val_loader:
+            print(f"[Data] Val: {len(val_dataset)} images")
     
     # Optimizer and scheduler
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)

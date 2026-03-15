@@ -8,10 +8,9 @@ Dual-Stream FLUX SR Evaluation - V2
 
 Usage:
     python evaluate_dual_control_v2.py \
-        --checkpoint checkpoints/dual_control/xxx/best_model.pt \
         --hr_dir Data/DIV2K/DIV2K_valid_HR \
         --lr_dir Data/DIV2K/DIV2K_valid_LR_bicubic_X4 \
-        --tile_size 1024 --overlap 128
+        --tile_size 1024 --overlap 128  --checkpoint checkpoints/dual_control/xxx/best_model.pt
 """
 
 import os
@@ -125,17 +124,13 @@ class DualStreamEvaluator:
         
         dtype = torch.bfloat16
         
-        print(f"[Eval] Loading to {self.device}...")
-        
         # Load VAE
-        print("[Eval] Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(
             self.model_name, subfolder="vae", torch_dtype=dtype
         ).to(self.device)
         self.vae.requires_grad_(False)
         
         # Cache embeddings
-        print("[Eval] Caching text embeddings...")
         text_enc = CLIPTextModel.from_pretrained(
             self.model_name, subfolder="text_encoder", torch_dtype=dtype
         ).to(self.device)
@@ -161,49 +156,37 @@ class DualStreamEvaluator:
         gc.collect()
         
         # Load Transformer
-        print("[Eval] Loading FLUX Transformer...")
         self.transformer = FluxTransformer2DModel.from_pretrained(
             self.model_name, subfolder="transformer", torch_dtype=dtype
         ).to(self.device)
         self.transformer.requires_grad_(False)
         
         # Load ControlNet
-        print("[Eval] Loading ControlNet...")
         self.controlnet = FluxControlNetModel.from_pretrained(
             "jasperai/Flux.1-dev-Controlnet-Upscaler", torch_dtype=dtype
         ).to(self.device)
         
         # Pixel Extractor
-        print("[Eval] Initializing Pixel Feature Extractor...")
         self.pixel_extractor = PixelFeatureExtractor(latent_channels=16).to(self.device).to(dtype)
         
         # Load checkpoint
         if self.checkpoint_path and os.path.exists(self.checkpoint_path):
-            print(f"[Eval] Loading checkpoint: {self.checkpoint_path}")
             ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
             self.ckpt_info = ckpt
             
             if 'pixel_weight' in ckpt:
                 self.pixel_weight = ckpt['pixel_weight']
-                print(f"[Eval] Loaded pixel_weight: {self.pixel_weight}")
             
             if 'flow_mode' in ckpt:
                 self.flow_mode = ckpt['flow_mode']
-                print(f"[Eval] Loaded flow_mode: {self.flow_mode}")
             
             if 'pixel_extractor' in ckpt:
                 state = {k.replace('module.', ''): v for k, v in ckpt['pixel_extractor'].items()}
                 self.pixel_extractor.load_state_dict(state)
-                print("[Eval] ✓ Loaded Pixel Extractor")
             
             if 'controlnet' in ckpt:
                 state = {k.replace('module.', ''): v for k, v in ckpt['controlnet'].items()}
                 self.controlnet.load_state_dict(state)
-                print("[Eval] ✓ Loaded ControlNet")
-            
-            print(f"[Eval] Checkpoint info: epoch={ckpt.get('epoch', '?')}, psnr={ckpt.get('psnr', 0):.2f}")
-        else:
-            print("[Eval] No checkpoint loaded - using pretrained weights")
         
         # 启用 Flash Attention
         self._enable_flash_attention()
@@ -211,34 +194,22 @@ class DualStreamEvaluator:
         self.controlnet.eval()
         self.pixel_extractor.eval()
         self.transformer.eval()
-        
-        print(f"[Eval] Ready. pixel_weight={self.pixel_weight}")
     
     def _enable_flash_attention(self):
         """启用 Flash Attention 加速"""
         try:
             self.transformer.enable_xformers_memory_efficient_attention()
             self.controlnet.enable_xformers_memory_efficient_attention()
-            print("[Flash] ✓ Enabled xformers memory efficient attention")
-        except Exception as e:
-            print(f"[Flash] xformers not available, using PyTorch 2.0 SDPA")
+        except Exception:
+            pass  # 默认使用 PyTorch 2.0 SDPA
     
     def encode(self, img):
         """Encode image to latent"""
-        lat = self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample()
-        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
-            lat = (lat - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-        else:
-            lat = lat * self.vae.config.scaling_factor
-        return lat
+        return self.vae.encode(img.to(self.vae.dtype)).latent_dist.sample() * self.vae.config.scaling_factor
     
     def decode(self, lat):
         """Decode latent to image"""
-        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
-            lat = (lat / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-        else:
-            lat = lat / self.vae.config.scaling_factor
-        return self.vae.decode(lat.to(self.vae.dtype)).sample
+        return self.vae.decode((lat / self.vae.config.scaling_factor).to(self.vae.dtype)).sample
     
     def _pack(self, x):
         B, C, H, W = x.shape
@@ -509,12 +480,39 @@ def main():
         else:
             args.dataset = 'Unknown'
     
-    # Experiment name
+    # Experiment name (会在加载模型后更新以包含 flow_mode)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Load model first to get flow_mode
+    initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 1.0
+    evaluator = DualStreamEvaluator(args.model_name, device, args.checkpoint, initial_pixel_weight)
+    evaluator.load()
+    
+    # Override pixel_weight if specified
+    if args.pixel_weight is not None:
+        evaluator.pixel_weight = args.pixel_weight
+    
+    # 确定 start_mode（必须与训练时的 validate 一致！）
+    if args.start_mode is not None:
+        start_mode = args.start_mode
+    else:
+        # 根据 flow_mode 自动选择（与 train validate 一致）
+        if evaluator.flow_mode == 'mean':
+            start_mode = 'mean'
+        elif evaluator.flow_mode == 'mixed':
+            start_mode = 'mixed'  # 🌟 mixed 训练就用 mixed 推理
+        else:
+            start_mode = 'standard'
+    
+    # 🌟 Mixed 模式默认 start_t=0.5（与 train validate 一致）
+    if start_mode == 'mixed' and args.start_t == 0.8:  # 如果用户没改默认值
+        args.start_t = 0.5
+    
+    # 现在可以生成包含 flow_mode 的 exp_name
     if args.exp_name:
         exp_name = args.exp_name
     else:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_name = f"{ts}_dual_v2_{args.num_steps}step"
+        exp_name = f"{ts}_{evaluator.flow_mode}_{args.num_steps}step"
     
     # Output directory
     output_dir = os.path.join(args.output_base, args.dataset, 'DualV2', exp_name)
@@ -529,34 +527,13 @@ def main():
     print("=" * 70)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Dataset: {args.dataset}")
+    print(f"Flow Mode: {evaluator.flow_mode}, Start Mode: {start_mode}" + 
+          (f", start_t: {args.start_t}" if start_mode == 'mixed' else ""))
+    print(f"Pixel Weight: {evaluator.pixel_weight}")
     print(f"Steps: {args.num_steps}, Guidance: {args.guidance}")
     print(f"Tile: {args.tile_size}, Overlap: {args.overlap}")
     print(f"Output: {output_dir}")
     print("=" * 70)
-    
-    # Load model
-    initial_pixel_weight = args.pixel_weight if args.pixel_weight is not None else 1.0
-    evaluator = DualStreamEvaluator(args.model_name, device, args.checkpoint, initial_pixel_weight)
-    evaluator.load()
-    
-    # Override pixel_weight if specified
-    if args.pixel_weight is not None:
-        evaluator.pixel_weight = args.pixel_weight
-        print(f"[Eval] Overriding pixel_weight to: {args.pixel_weight}")
-    
-    # 确定 start_mode
-    if args.start_mode is not None:
-        start_mode = args.start_mode
-        print(f"[Eval] Using start_mode: {start_mode}")
-    else:
-        # 根据 flow_mode 自动选择
-        if evaluator.flow_mode == 'mean':
-            start_mode = 'mean'
-        elif evaluator.flow_mode == 'mixed':
-            start_mode = 'mean'  # mixed 训练时，推理用 mean 更稳定
-        else:
-            start_mode = 'standard'
-        print(f"[Eval] Auto start_mode: {start_mode} (from flow_mode={evaluator.flow_mode})")
     
     # Load LPIPS
     lpips_fn = None
@@ -683,6 +660,9 @@ def main():
         f.write("=" * 60 + "\n")
         f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
+        f.write(f"Flow Mode: {evaluator.flow_mode}\n")
+        f.write(f"Start Mode: {start_mode}" + 
+                (f", start_t: {args.start_t}" if start_mode == 'mixed' else "") + "\n")
         f.write(f"Pixel Weight: {evaluator.pixel_weight}\n")
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Images: {len(psnr_list)}\n")
